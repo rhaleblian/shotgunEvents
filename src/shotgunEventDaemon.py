@@ -25,8 +25,8 @@ http://shotgunsoftware.github.com/shotgunEvents
 
 from __future__ import print_function
 
-__version__ = "1.0"
-__version_info__ = (1, 0)
+__version__ = "2.0"
+__version_info__ = (2, 0)
 
 # Suppress the deprecation warning about imp until we get around to replacing it
 import warnings
@@ -35,19 +35,19 @@ with warnings.catch_warnings():
     warnings.filterwarnings("ignore", category=DeprecationWarning)
     import imp
 
+import configparser
 import datetime
+import json
 import logging
 import logging.handlers
 import os
+import pickle
+import pika
 import pprint
 import socket
 import sys
 import time
 import traceback
-from six.moves import configparser
-import six.moves.cPickle as pickle
-
-from distutils.version import StrictVersion
 
 if sys.platform == "win32":
     import win32serviceutil
@@ -61,10 +61,6 @@ from shotgun_api3.lib.sgtimezone import SgTimezone
 
 
 SG_TIMEZONE = SgTimezone()
-CURRENT_PYTHON_VERSION = StrictVersion(sys.version.split()[0])
-PYTHON_26 = StrictVersion("2.6")
-PYTHON_27 = StrictVersion("2.7")
-
 EMAIL_FORMAT_STRING = """Time: %(asctime)s
 Logger: %(name)s
 Path: %(pathname)s
@@ -254,13 +250,13 @@ class Engine(object):
     The engine holds the main loop of event processing.
     """
 
-    def __init__(self, configPath):
+    def __init__(self, configpath):
         """ """
         self._continue = True
         self._eventIdData = {}
 
         # Read/parse the config
-        self.config = Config(configPath)
+        self.config = Config(configpath)
 
         # Get config values
         self._pluginCollections = [
@@ -276,6 +272,10 @@ class Engine(object):
         self._conn_retry_sleep = self.config.getint("daemon", "conn_retry_sleep")
         self._fetch_interval = self.config.getint("daemon", "fetch_interval")
         self._use_session_uuid = self.config.getboolean("shotgun", "use_session_uuid")
+        try:
+            self._socket_timeout = self.config.getint("daemon", "socket_timeout")
+        except configparser.NoOptionError:
+            self._socket_timeout = 60
 
         # Setup the loggers for the main engine
         if self.config.getLogMode() == 0:
@@ -305,6 +305,9 @@ class Engine(object):
             _setFilePathOnLogger(self.timing_logger, timing_log_filename)
         else:
             self.timing_logger = None
+
+        self.connection = None
+        self.channel = None
 
         super(Engine, self).__init__()
 
@@ -477,6 +480,18 @@ class Engine(object):
 
         return lastEventId
 
+    def send(self, event):
+        """ Produce an event in RabbitMQ routed to "hello". """
+        body = {}
+        body.update(event)
+        for key, val in body.items():
+            # TODO there's a broader test, 3-part type()
+            if type(val) == datetime.datetime:
+                body[key] = str(val)
+        body = json.dumps(body)
+        self.channel.basic_publish(exchange="", routing_key="hello", body=body)
+        print(f" [x] Sent {body}")
+
     def _mainLoop(self):
         """
         Run the event processing loop.
@@ -500,12 +515,24 @@ class Engine(object):
         - Each time through the loop, if the pidFile is gone, stop.
         """
         self.log.debug("Starting the event processing loop.")
+        
+        self.connection = pika.BlockingConnection(pika.ConnectionParameters(host="localhost"))
+        self.channel = self.connection.channel()
+        self.channel.queue_declare(queue="hello")
+
         while self._continue:
             # Process events
             events = self._getNewEvents()
             for event in events:
+
+                # have plugins run anyway to avoid resends
+                # (install a noop plugin like logargs)
                 for collection in self._pluginCollections:
                     collection.process(event)
+
+                # send to RabbitMQ
+                self.send(event)
+
                 self._saveEventIdData()
 
             # if we're lagging behind Shotgun, we received a full batch of events
@@ -524,6 +551,8 @@ class Engine(object):
 
     def stop(self):
         self._continue = False
+        if self.connection:
+            self.connection.close()
 
     def _getNewEvents(self):
         """
@@ -599,8 +628,7 @@ class Engine(object):
                 if state:
                     try:
                         with open(eventIdFile, "wb") as fh:
-                            # Use protocol 2 so it can also be loaded in Python 2
-                            pickle.dump(self._eventIdData, fh, protocol=2)
+                            pickle.dump(self._eventIdData, fh)
                     except OSError as err:
                         self.log.error(
                             "Can not write event id data to %s.\n\n%s",
@@ -1188,11 +1216,7 @@ class CustomSMTPHandler(logging.handlers.SMTPHandler):
     ):
         args = [smtpServer, fromAddr, toAddrs, emailSubject, credentials]
         if credentials:
-            # Python 2.7 implemented the secure argument
-            if CURRENT_PYTHON_VERSION >= PYTHON_27:
-                args.append(secure)
-            else:
-                self.secure = secure
+            args.append(secure)
 
         logging.handlers.SMTPHandler.__init__(self, *args)
 
@@ -1331,12 +1355,6 @@ class LinuxDaemon(daemonizer.Daemon):
 
 def main():
     """ """
-    if CURRENT_PYTHON_VERSION <= PYTHON_26:
-        print(
-            "Python 2.5 and older is not supported anymore. Please use Python 2.6 or newer."
-        )
-        return 3
-
     action = None
     if len(sys.argv) > 1:
         action = sys.argv[1]
@@ -1364,7 +1382,8 @@ def _getConfigPath():
     """
     Get the path to the configuration file.
     """
-    paths = ["/etc/shotgun", os.path.dirname(__file__)]
+    filename = "shotgunEventDaemon.conf"
+    paths = [".", os.path.dirname(__file__), "etc/shotgun", "/etc/shotgun"]
 
     # Get the current path of the daemon script
     scriptPath = sys.argv[0]
@@ -1378,12 +1397,13 @@ def _getConfigPath():
 
     # Search for a config file.
     for path in paths:
-        path = os.path.join(path, "shotgunEventDaemon.conf")
+        path = os.path.join(path, filename)
         if os.path.exists(path):
+            print(f"found config at {path}")
             return path
 
     # No config file was found
-    raise EventDaemonError("Config path not found, searched %s" % ", ".join(paths))
+    raise EventDaemonError(f"{filename} not found, searched {paths}")
 
 
 if __name__ == "__main__":
