@@ -22,5 +22,7 @@ steps:
 
 - script: |
     pip install pytest pytest-azurepipelines
-    pytest
+    # pytest
+    pwd
+    find .
   displayName: 'pytest'
