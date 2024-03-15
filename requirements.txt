@@ -8,3 +8,5 @@
 
 # Used for Python2/3 compatibility
 six
+
+shotgun-api3
