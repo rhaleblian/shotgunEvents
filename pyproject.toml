@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools >= 61.0"]
+build-backend = "setuptools.build_meta"
+[project]
+name = "shotgun-eventmanager"
+requires-python = ">= 3.9"
+version = "2024.1.0"
+dependencies = [
+  "six",
+  "shotgun-api3"
+]
+# [project.optional-dependencies]
+# dev = [
+#   "autopep8",
+#   "pylint",
+# ]
+#[project.scripts]
+#eventd = "shotgunEventDaemon:main"
